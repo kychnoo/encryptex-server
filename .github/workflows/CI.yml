@@ -1,0 +1,55 @@
+name: Rust CI
+
+on:
+    push:
+        branches: [ "master", "dev" ]
+    pull_request:
+        branches: [ "master", "dev" ]
+
+env:
+    CARGO_TERM_COLOR: always
+    DATABASE_URL: postgres://postgres:postgres@localhost:5432/encryptex_server
+
+jobs:
+    test:
+        name: Test on ${{ matrix.os }}
+        runs-on: ${{ matrix.os }}
+        strategy:
+            matrix:
+                os: [ubuntu-latest, windows-latest]
+
+        services:
+            postgres:
+                image: postgres:16
+                env:
+                    POSTGRES_USER: postgres
+                    POSTGRES_PASSWORD: postgres
+                    POSTGRES_DB: encryptex_server
+                ports:
+                    - 5432:5432
+                options: >-
+                    --health-cmd pg_isready
+                    --health-interval 10s
+                    --health-timeout 5s
+                    --health-retries 5
+
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v7
+
+            - name: Install Rust Toolchain
+              uses: dtolnay/rust-toolchain@stable
+
+            - name: Rust Cache
+              uses: Swatinem/rust-cache@v2
+
+            - name: Install sqlx CLI
+              run: cargo install sqlx-cli --no-default-features --features postgres
+
+            - name: Run Migrations
+              run: sqlx migrate run
+
+            - name: Run Tests
+              run: cargo test --verbose
+
+

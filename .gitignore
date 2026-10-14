@@ -1,0 +1,11 @@
+# Cache and binaries.
+/target
+
+# Env file.
+.env
+
+# VSCode
+.vscode/
+
+# JetBrains IDEs
+.idea/
