@@ -19,6 +19,8 @@ use uuid::Uuid;
 
 use crate::{
     auth::AuthUser,
+    error::{ErrorResult, api_error},
+    json::AppJson,
     models::{
         chat::CreateChat,
         message::SendMessage,
@@ -95,7 +97,7 @@ async fn register_and_login(state: &AppState, prefix: &str, public_key: &str) ->
 
     let Json(created) = create_user(
         State(state.clone()),
-        Json(CreateUser {
+        AppJson(CreateUser {
             username: username.clone(),
             password: password.clone(),
         }),
@@ -117,7 +119,7 @@ async fn login_with_key(
         State(state.clone()),
         test_addr(),
         test_headers(),
-        Json(LoginRequest {
+        AppJson(LoginRequest {
             username: username.to_string(),
             password: password.to_string(),
             public_key: public_key.to_string(),
@@ -191,7 +193,7 @@ async fn register_login_me_flow() {
     let username = format!("flow_{}", Uuid::new_v4().simple());
     let Json(created) = create_user(
         State(state.clone()),
-        Json(CreateUser {
+        AppJson(CreateUser {
             username: username.clone(),
             password: "password-123".to_string(),
         }),
@@ -229,7 +231,7 @@ async fn login_rejects_bad_credentials() {
     let username = format!("badcreds_{}", Uuid::new_v4().simple());
     let Json(created) = create_user(
         State(state.clone()),
-        Json(CreateUser {
+        AppJson(CreateUser {
             username: username.clone(),
             password: "right-password".to_string(),
         }),
@@ -242,28 +244,42 @@ async fn login_rejects_bad_credentials() {
         State(state.clone()),
         test_addr(),
         test_headers(),
-        Json(LoginRequest {
+        AppJson(LoginRequest {
             username: username.clone(),
             password: "wrong-password".to_string(),
             public_key: "k".to_string(),
         }),
     )
     .await;
-    assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        result.unwrap_err(),
+        api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_credentials",
+            "Invalid authorization credentials"
+        )
+    );
 
     // Unknown user.
     let result = login(
         State(state.clone()),
         test_addr(),
         test_headers(),
-        Json(LoginRequest {
+        AppJson(LoginRequest {
             username: format!("ghost_{}", Uuid::new_v4().simple()),
             password: "whatever".to_string(),
             public_key: "k".to_string(),
         }),
     )
     .await;
-    assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        result.unwrap_err(),
+        api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_credentials",
+            "Invalid authorization credentials",
+        )
+    );
 
     cleanup(&state, &[created.id]).await;
 }
@@ -343,7 +359,7 @@ async fn chat_and_message_flow() {
     let Json(chat) = create_chat(
         State(state.clone()),
         auth_of(&alice),
-        Json(CreateChat {
+        AppJson(CreateChat {
             member_ids: vec![bob.id],
             is_group: false,
             name: None,
@@ -377,7 +393,7 @@ async fn chat_and_message_flow() {
             State(state.clone()),
             auth_of(sender),
             Path(chat.id),
-            Json(SendMessage {
+            AppJson(SendMessage {
                 text: text.to_string(),
             }),
         )
@@ -407,7 +423,7 @@ async fn chat_and_message_flow() {
             State(state.clone()),
             auth_of(&outsider),
             Path(chat.id),
-            Json(SendMessage {
+            AppJson(SendMessage {
                 text: "sneaky".to_string(),
             }),
         )
@@ -432,7 +448,7 @@ async fn create_chat_auto_adds_creator_and_skips_self_duplicates() {
     let Json(chat) = create_chat(
         State(state.clone()),
         auth_of(&alice),
-        Json(CreateChat {
+        AppJson(CreateChat {
             member_ids: vec![alice.id, alice.id],
             is_group: false,
             name: None,
@@ -464,7 +480,7 @@ async fn send_message_broadcasts_to_ws_members() {
     let Json(chat) = create_chat(
         State(state.clone()),
         auth_of(&alice),
-        Json(CreateChat {
+        AppJson(CreateChat {
             member_ids: vec![bob.id],
             is_group: false,
             name: None,
@@ -481,7 +497,7 @@ async fn send_message_broadcasts_to_ws_members() {
         State(state.clone()),
         auth_of(&alice),
         Path(chat.id),
-        Json(SendMessage {
+        AppJson(SendMessage {
             text: "hello via ws".to_string(),
         }),
     )
@@ -516,7 +532,7 @@ async fn sessions_list_and_signed_delete() {
     // Register, then open two real sessions sharing one device key.
     let Json(created) = create_user(
         State(state.clone()),
-        Json(CreateUser {
+        AppJson(CreateUser {
             username: username.clone(),
             password: "password-123".to_string(),
         }),
@@ -542,14 +558,21 @@ async fn sessions_list_and_signed_delete() {
         State(state.clone()),
         auth_of(&first),
         Path(second.session_id),
-        Json(DeleteSessionRequest {
+        AppJson(DeleteSessionRequest {
             nonce: invented.clone(),
             signature: sign_delete_session(&signing, &second.session_id, &invented),
         }),
     )
     .await
     .unwrap_err();
-    assert_eq!(invented_err, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        invented_err,
+        api_error(
+            StatusCode::UNAUTHORIZED,
+            "incorrect_nonce",
+            "Nonce is incorrect",
+        )
+    );
 
     // A nonce issued to one session cannot be spent from another session.
     // (Both sessions are still alive here so the nonce insert succeeds.)
@@ -560,14 +583,21 @@ async fn sessions_list_and_signed_delete() {
         State(state.clone()),
         auth_of(&first),
         Path(first.session_id),
-        Json(DeleteSessionRequest {
+        AppJson(DeleteSessionRequest {
             nonce: foreign_nonce.nonce.clone(),
             signature: sign_delete_session(&signing, &first.session_id, &foreign_nonce.nonce),
         }),
     )
     .await
     .unwrap_err();
-    assert_eq!(cross_session_err, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        cross_session_err,
+        api_error(
+            StatusCode::UNAUTHORIZED,
+            "incorrect_nonce",
+            "Nonce is incorrect",
+        )
+    );
 
     // Signed delete of the second session succeeds (nonce issued to the
     // caller's own session, signature bound to the target session).
@@ -578,7 +608,7 @@ async fn sessions_list_and_signed_delete() {
         State(state.clone()),
         auth_of(&first),
         Path(second.session_id),
-        Json(DeleteSessionRequest {
+        AppJson(DeleteSessionRequest {
             nonce: nonce.nonce.clone(),
             signature: sign_delete_session(&signing, &second.session_id, &nonce.nonce),
         }),
@@ -592,14 +622,21 @@ async fn sessions_list_and_signed_delete() {
         State(state.clone()),
         auth_of(&first),
         Path(second.session_id),
-        Json(DeleteSessionRequest {
+        AppJson(DeleteSessionRequest {
             nonce: nonce.nonce.clone(),
             signature: sign_delete_session(&signing, &second.session_id, &nonce.nonce),
         }),
     )
     .await
     .unwrap_err();
-    assert_eq!(replay, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        replay,
+        api_error(
+            StatusCode::UNAUTHORIZED,
+            "incorrect_nonce",
+            "Nonce is incorrect",
+        )
+    );
 
     // A signature from a different key is rejected.
     let Json(fresh) = get_nonce(State(state.clone()), auth_of(&first))
@@ -610,14 +647,21 @@ async fn sessions_list_and_signed_delete() {
         State(state.clone()),
         auth_of(&first),
         Path(first.session_id),
-        Json(DeleteSessionRequest {
+        AppJson(DeleteSessionRequest {
             nonce: fresh.nonce,
             signature: forged,
         }),
     )
     .await
     .unwrap_err();
-    assert_eq!(forged_err, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        forged_err,
+        api_error(
+            StatusCode::UNAUTHORIZED,
+            "key_not_verified",
+            "Key not verified",
+        )
+    );
 
     // Deleting a missing session reports NOT_FOUND (with a fresh valid signature).
     let Json(last) = get_nonce(State(state.clone()), auth_of(&first))
@@ -628,14 +672,21 @@ async fn sessions_list_and_signed_delete() {
         State(state.clone()),
         auth_of(&first),
         Path(missing_id),
-        Json(DeleteSessionRequest {
+        AppJson(DeleteSessionRequest {
             nonce: last.nonce.clone(),
             signature: sign_delete_session(&signing, &missing_id, &last.nonce),
         }),
     )
     .await
     .unwrap_err();
-    assert_eq!(missing_err, StatusCode::NOT_FOUND);
+    assert_eq!(
+        missing_err,
+        api_error(
+            StatusCode::NOT_FOUND,
+            "session_not_found",
+            "Session not found",
+        )
+    );
 
     cleanup(&state, &[created.id]).await;
 }
@@ -691,14 +742,21 @@ async fn users_cannot_delete_foreign_sessions() {
         State(state.clone()),
         auth_of(&attacker),
         Path(victim_session_id.0),
-        Json(DeleteSessionRequest {
+        AppJson(DeleteSessionRequest {
             nonce: nonce.nonce.clone(),
             signature: sign_delete_session(&attacker_signing, &victim_session_id.0, &nonce.nonce),
         }),
     )
     .await
     .unwrap_err();
-    assert_eq!(err, StatusCode::NOT_FOUND);
+    assert_eq!(
+        err,
+        api_error(
+            StatusCode::NOT_FOUND,
+            "session_not_found",
+            "Session not found",
+        )
+    );
 
     cleanup(&state, &[victim.id, attacker.id]).await;
 }

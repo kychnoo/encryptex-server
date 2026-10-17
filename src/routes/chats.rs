@@ -3,6 +3,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::AuthUser,
+    json::AppJson,
     models::chat::{Chat, CreateChat},
     state::AppState,
 };
@@ -19,7 +20,7 @@ pub(crate) fn resolve_member_ids(creator: Uuid, requested: Vec<Uuid>) -> Vec<Uui
 pub async fn create_chat(
     State(state): State<AppState>,
     auth: AuthUser,
-    Json(payload): Json<CreateChat>,
+    AppJson(payload): AppJson<CreateChat>,
 ) -> Result<Json<Chat>, StatusCode> {
     let chat_id = Uuid::now_v7();
 

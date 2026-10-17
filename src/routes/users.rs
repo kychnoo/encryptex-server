@@ -3,16 +3,30 @@ use uuid::Uuid;
 
 use crate::{
     auth::{self, AuthUser},
+    error::ErrorResult,
+    json::AppJson,
     models::user::{CreateUser, User},
     state::AppState,
 };
 
 pub async fn create_user(
     State(state): State<AppState>,
-    Json(payload): Json<CreateUser>,
-) -> Result<Json<User>, StatusCode> {
+    AppJson(payload): AppJson<CreateUser>,
+) -> Result<Json<User>, (StatusCode, ErrorResult)> {
     let id = Uuid::now_v7();
-    let password_hash = auth::hash_password(&payload.password);
+    let password = payload.password.clone();
+    let password_hash = tokio::task::spawn_blocking(move || auth::hash_password(&password))
+        .await
+        .map_err(|e| {
+            eprintln!("{e:?}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorResult {
+                    status: "error_hashing_password".to_string(),
+                    message: e.to_string(),
+                },
+            )
+        })?;
     let user = sqlx::query_as::<_, User>(
         "INSERT INTO users (id, username, password_hash) VALUES ($1, $2, $3) RETURNING id, username",
     )
@@ -21,7 +35,21 @@ pub async fn create_user(
     .bind(password_hash)
     .fetch_one(&state.db)
     .await
-    .map_err(|_| { eprintln!("Error on insert a new user in DB."); StatusCode::INTERNAL_SERVER_ERROR })?;
+    .map_err(|e| {
+        if let Some(db) = e.as_database_error() {
+            if db.is_unique_violation() {
+                return (StatusCode::CONFLICT, ErrorResult {
+                    status: "username_taken".into(),
+                    message: "Username is already taken".into(),
+                });
+            }
+        }
+        eprintln!("create_user: {e:?}");
+        (StatusCode::INTERNAL_SERVER_ERROR, ErrorResult {
+            status: "internal_error".into(),
+            message: "Internal server error".into(),
+        })
+    })?;
 
     Ok(Json(user))
 }

@@ -1,4 +1,6 @@
 mod auth;
+mod error;
+mod json;
 mod models;
 mod routes;
 mod state;
@@ -14,6 +16,7 @@ use axum::{
 };
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::RwLock;
+use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 
 use crate::{
     routes::{
@@ -44,9 +47,21 @@ async fn main() {
         connections: Arc::new(RwLock::new(HashMap::new())),
     };
 
+    let governor_conf = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_second(6)
+            .burst_size(5)
+            .finish()
+            .unwrap(),
+    );
+    let limiter = GovernorLayer::new(governor_conf);
+
     let app = Router::new()
-        .route("/users", post(create_user).get(list_users))
-        .route("/login", post(login))
+        .route(
+            "/users",
+            post(create_user).layer(limiter.clone()).get(list_users),
+        )
+        .route("/login", post(login).layer(limiter.clone()))
         .route("/me", get(me))
         .route("/chats", post(create_chat).get(list_my_chats))
         .route(

@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::AuthUser,
+    json::AppJson,
     models::message::{Message, SendMessage},
     state::AppState,
 };
@@ -16,7 +17,7 @@ pub async fn send_message(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(chat_id): Path<Uuid>,
-    Json(payload): Json<SendMessage>,
+    AppJson(payload): AppJson<SendMessage>,
 ) -> Result<Json<Message>, StatusCode> {
     let is_member: Option<(i32,)> =
         sqlx::query_as("SELECT 1 FROM chat_members WHERE chat_id = $1 AND user_id = $2")
