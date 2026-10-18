@@ -18,6 +18,7 @@ pub struct DeleteSessionRequest {
 #[derive(Debug, Serialize)]
 pub struct LoginResponse {
     pub token: String,
+    pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize)]
@@ -36,6 +37,18 @@ pub struct UserWithPassword {
 pub struct Session {
     pub id: Uuid,
     pub user_id: Uuid,
+    pub token: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct RefreshRequest {
+    pub nonce: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RefreshResponse {
     pub token: String,
     pub expires_at: DateTime<Utc>,
 }

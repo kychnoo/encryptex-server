@@ -20,7 +20,8 @@ use crate::{
     error::{ApiError, ErrorResult, api_error, internal_error},
     json::AppJson,
     models::session::{
-        DeleteSessionRequest, LoginRequest, LoginResponse, NonceResponse, Session, UserWithPassword,
+        DeleteSessionRequest, LoginRequest, LoginResponse, NonceResponse, RefreshRequest,
+        RefreshResponse, Session, UserWithPassword,
     },
     state::AppState,
 };
@@ -28,6 +29,7 @@ use crate::{
 static DUMMY_HASH: LazyLock<String> = LazyLock::new(|| auth::hash_password("dummy-password"));
 
 const MAX_FAILURES: i64 = 5;
+const SESSION_TTL_HOURS: i64 = 72;
 
 async fn is_locked_out(db: &PgPool, username: &str) -> Result<bool, ApiError> {
     sqlx::query("DELETE FROM login_failures WHERE created_at < now() - interval '15 minutes'")
@@ -117,7 +119,7 @@ pub async fn login(
         .bind(device_info)
         .bind(addr.ip().to_string())
         .bind(&payload.public_key)
-        .bind(Utc::now() + Duration::days(30))
+        .bind(Utc::now() + Duration::hours(SESSION_TTL_HOURS))
         .execute(&state.db)
         .await
         .map_err(internal_error)?;
@@ -128,7 +130,10 @@ pub async fn login(
         .await
         .map_err(internal_error)?;
 
-    Ok(Json(LoginResponse { token }))
+    Ok(Json(LoginResponse {
+        token: token,
+        expires_at: Utc::now() + Duration::hours(SESSION_TTL_HOURS),
+    }))
 }
 
 pub async fn list_sessions(
@@ -146,45 +151,107 @@ pub async fn list_sessions(
     Ok(Json(sessions))
 }
 
-pub async fn delete_session(
+pub async fn refresh(
     State(state): State<AppState>,
     auth: AuthUser,
-    Path(session_id): Path<Uuid>,
-    AppJson(payload): AppJson<DeleteSessionRequest>,
-) -> Result<StatusCode, ApiError> {
-    let current_key: Option<(String,)> =
-        sqlx::query_as("SELECT public_key FROM sessions WHERE user_id = $1 AND token = $2")
-            .bind(auth.user_id)
-            .bind(&auth.token)
-            .fetch_optional(&state.db)
+    AppJson(payload): AppJson<RefreshRequest>,
+) -> Result<Json<RefreshResponse>, ApiError> {
+    let message = refresh_message(&payload.nonce);
+    verify_device_signature(
+        &state.db,
+        auth.session_id,
+        &payload.nonce,
+        &message,
+        &payload.signature,
+    )
+    .await?;
+
+    let (not_expired,): (bool,) =
+        sqlx::query_as("SELECT expires_at > now() FROM sessions WHERE id = $1")
+            .bind(auth.session_id)
+            .fetch_one(&state.db)
             .await
             .map_err(internal_error)?;
+    if !not_expired {
+        return Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "token_expired",
+            "Token is expired and cannot be refreshed",
+        ));
+    }
 
-    let (public_key_pem,) = current_key.ok_or(api_error(
-        StatusCode::UNAUTHORIZED,
-        "key_not_found",
-        "Key not found",
-    ))?;
+    let token = generate_token();
+    let expires_at = Utc::now() + Duration::hours(SESSION_TTL_HOURS);
 
+    sqlx::query(
+        "UPDATE sessions
+        SET prev_token = token,
+            prev_token_valid_until = now() + interval '2 minutes',
+            token = $1,
+            expires_at = $2
+        WHERE id = $3",
+    )
+    .bind(&token)
+    .bind(expires_at)
+    .bind(auth.session_id)
+    .execute(&state.db)
+    .await
+    .map_err(internal_error)?;
+
+    Ok(Json(RefreshResponse { token, expires_at }))
+}
+
+pub async fn verify_device_signature(
+    db: &PgPool,
+    session_id: Uuid,
+    nonce: &str,
+    message: &str,
+    signature_b64: &str,
+) -> Result<(), ApiError> {
     let consumed = sqlx::query(
         "DELETE FROM nonces WHERE nonce = $1 AND session_id = $2 AND expires_at > now()",
     )
-    .bind(&payload.nonce)
-    .bind(auth.session_id)
-    .execute(&state.db)
+    .bind(nonce)
+    .bind(session_id)
+    .execute(db)
     .await
     .map_err(internal_error)?;
 
     if consumed.rows_affected() != 1 {
         return Err(api_error(
             StatusCode::UNAUTHORIZED,
-            "incorrect_nonce",
-            "Nonce is incorrect",
+            "invalid_nonce",
+            "Invalid or expired nonce",
         ));
     }
 
+    let (pem,): (Option<String>,) = sqlx::query_as("SELECT public_key FROM sessions WHERE id = $1")
+        .bind(session_id)
+        .fetch_one(db)
+        .await
+        .map_err(internal_error)?;
+
+    let pem =
+        pem.ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "key_not_found", "Key not found"))?;
+
+    verify_nonce_signature(&pem, message, signature_b64)
+}
+
+pub async fn delete_session(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(session_id): Path<Uuid>,
+    AppJson(payload): AppJson<DeleteSessionRequest>,
+) -> Result<StatusCode, ApiError> {
     let message = delete_session_message(&session_id, &payload.nonce);
-    verify_nonce_signature(&public_key_pem, &message, &payload.signature)?;
+    verify_device_signature(
+        &state.db,
+        auth.session_id,
+        &payload.nonce,
+        &message,
+        &payload.signature,
+    )
+    .await?;
 
     let result = sqlx::query("DELETE FROM sessions WHERE id = $1 AND user_id = $2")
         .bind(session_id)
@@ -227,6 +294,10 @@ pub(crate) fn parse_public_key(pem: &str) -> Result<VerifyingKey, Box<dyn std::e
 
 pub(crate) fn delete_session_message(session_id: &Uuid, nonce: &str) -> String {
     format!("delete-session:{session_id}:{nonce}")
+}
+
+pub(crate) fn refresh_message(nonce: &str) -> String {
+    format!("refresh-session:{nonce}")
 }
 
 pub(crate) fn verify_nonce_signature(
@@ -384,6 +455,22 @@ mod tests {
     }
 
     #[test]
+    fn refresh_message_format_is_pinned() {
+        let nonce = "abc123";
+        assert_eq!(refresh_message(&nonce), format!("refresh-session:{nonce}"))
+    }
+
+    #[test]
+    fn refresh_messages_differ_from_delete_messages() {
+        let session_id = Uuid::new_v4();
+        assert_ne!(
+            refresh_message("n"),
+            delete_session_message(&session_id, "n"),
+            "authorization scopes must not be cross-forgeable"
+        );
+    }
+
+    #[test]
     fn tampered_nonce_fails_verification() {
         let signing = test_signing_key(7);
         let session_id = Uuid::new_v4();
@@ -532,12 +619,48 @@ mod tests {
     }
 
     #[test]
-    fn login_and_nonce_responses_serialize() {
+    fn refresh_request_requires_all_fields() {
+        let payload = RefreshRequest {
+            nonce: "nonce-1".to_string(),
+            signature: "sig".to_string(),
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        let parsed: RefreshRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.nonce, "nonce-1");
+
+        for incomplete in [
+            serde_json::json!({"nonce": "nonce-1"}),
+            serde_json::json!({}),
+        ] {
+            assert!(
+                serde_json::from_value::<RefreshRequest>(incomplete).is_err(),
+                "missing fields must fail"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_responses_serialize_with_expiry() {
+        let expiration_date = Utc::now() + Duration::hours(SESSION_TTL_HOURS);
         let login = serde_json::to_value(LoginResponse {
             token: "tok".to_string(),
+            expires_at: expiration_date,
         })
         .unwrap();
-        assert_eq!(login, serde_json::json!({"token": "tok"}));
+        assert_eq!(
+            login,
+            serde_json::json!({"token": "tok", "expires_at": &expiration_date})
+        );
+
+        let refresh = serde_json::to_value(RefreshResponse {
+            token: "new-tok".to_string(),
+            expires_at: expiration_date,
+        })
+        .unwrap();
+        assert_eq!(
+            refresh,
+            serde_json::json!({"token": "new-tok", "expires_at": &expiration_date})
+        );
 
         let nonce = serde_json::to_value(NonceResponse {
             nonce: "n".to_string(),

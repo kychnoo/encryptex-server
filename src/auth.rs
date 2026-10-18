@@ -60,7 +60,7 @@ impl FromRequestParts<AppState> for AuthUser {
         let token = extract_bearer_token(header_value).ok_or(StatusCode::UNAUTHORIZED)?;
 
         let row: Option<(Uuid, Uuid, chrono::DateTime<Utc>)> =
-            sqlx::query_as("SELECT id, user_id, expires_at FROM sessions WHERE token = $1")
+            sqlx::query_as("SELECT id, user_id, expires_at FROM sessions WHERE token = $1 OR (prev_token= $1 AND prev_token_valid_until > now())")
                 .bind(token)
                 .fetch_optional(&state.db)
                 .await
@@ -71,8 +71,8 @@ impl FromRequestParts<AppState> for AuthUser {
             return Err(StatusCode::UNAUTHORIZED);
         }
 
-        sqlx::query("UPDATE sessions SET last_used_at = now() WHERE token = $1")
-            .bind(token)
+        sqlx::query("UPDATE sessions SET last_used_at = now() WHERE id = $1")
+            .bind(id)
             .execute(&state.db)
             .await
             .ok();

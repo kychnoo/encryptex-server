@@ -20,7 +20,7 @@ use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 
 use crate::{
     routes::{
-        auth::{delete_session, get_nonce, list_sessions, login},
+        auth::{delete_session, get_nonce, list_sessions, login, refresh},
         chats::{create_chat, list_my_chats},
         messages::{list_messages, send_message},
         users::{create_user, list_users, me},
@@ -62,6 +62,7 @@ async fn main() {
             post(create_user).layer(limiter.clone()).get(list_users),
         )
         .route("/login", post(login).layer(limiter.clone()))
+        .route("/refresh", post(refresh))
         .route("/me", get(me))
         .route("/chats", post(create_chat).get(list_my_chats))
         .route(

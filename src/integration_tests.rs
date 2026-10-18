@@ -19,16 +19,19 @@ use uuid::Uuid;
 
 use crate::{
     auth::AuthUser,
-    error::{ErrorResult, api_error},
+    error::api_error,
     json::AppJson,
     models::{
         chat::CreateChat,
         message::SendMessage,
-        session::{DeleteSessionRequest, LoginRequest},
+        session::{DeleteSessionRequest, LoginRequest, RefreshRequest},
         user::CreateUser,
     },
     routes::{
-        auth::{delete_session, delete_session_message, get_nonce, list_sessions, login},
+        auth::{
+            delete_session, delete_session_message, get_nonce, list_sessions, login, refresh,
+            refresh_message,
+        },
         chats::{create_chat, list_my_chats},
         messages::{list_messages, send_message},
         users::{create_user, me},
@@ -181,6 +184,10 @@ fn sign_message(signing: &SigningKey, message: &str) -> String {
 
 fn sign_delete_session(signing: &SigningKey, session_id: &Uuid, nonce: &str) -> String {
     sign_message(signing, &delete_session_message(session_id, nonce))
+}
+
+fn sign_refresh(signing: &SigningKey, nonce: &str) -> String {
+    sign_message(signing, &refresh_message(nonce))
 }
 
 #[tokio::test]
@@ -569,8 +576,8 @@ async fn sessions_list_and_signed_delete() {
         invented_err,
         api_error(
             StatusCode::UNAUTHORIZED,
-            "incorrect_nonce",
-            "Nonce is incorrect",
+            "invalid_nonce",
+            "Invalid or expired nonce",
         )
     );
 
@@ -594,8 +601,8 @@ async fn sessions_list_and_signed_delete() {
         cross_session_err,
         api_error(
             StatusCode::UNAUTHORIZED,
-            "incorrect_nonce",
-            "Nonce is incorrect",
+            "invalid_nonce",
+            "Invalid or expired nonce",
         )
     );
 
@@ -633,8 +640,8 @@ async fn sessions_list_and_signed_delete() {
         replay,
         api_error(
             StatusCode::UNAUTHORIZED,
-            "incorrect_nonce",
-            "Nonce is incorrect",
+            "invalid_nonce",
+            "Invalid or expired nonce",
         )
     );
 
@@ -759,4 +766,467 @@ async fn users_cannot_delete_foreign_sessions() {
     );
 
     cleanup(&state, &[victim.id, attacker.id]).await;
+}
+
+#[tokio::test]
+async fn refresh_rotates_token_and_persists_grace_token() {
+    let Some(state) = test_state().await else {
+        skip_notice("refresh_rotates_token_and_persists_grace_token");
+        return;
+    };
+
+    let signing = signing_key(31);
+    let user = register_and_login(&state, "refresher", &public_key_pem(&signing)).await;
+    let old_token = user.token.clone();
+    let old_expires_at: (chrono::DateTime<chrono::Utc>,) =
+        sqlx::query_as("SELECT expires_at FROM sessions WHERE id = $1")
+            .bind(user.session_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+
+    let Json(nonce) = get_nonce(State(state.clone()), auth_of(&user))
+        .await
+        .unwrap();
+
+    let Json(rotated) = refresh(
+        State(state.clone()),
+        auth_of(&user),
+        AppJson(RefreshRequest {
+            nonce: nonce.nonce.clone(),
+            signature: sign_refresh(&signing, &nonce.nonce),
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Response carries a fresh token with a future expiry.
+    assert_ne!(rotated.token, old_token, "refresh must rotate the token");
+    assert!(rotated.expires_at > chrono::Utc::now() + chrono::Duration::hours(70));
+
+    // The new token is persisted and resolves through the extractor...
+    let new_auth = {
+        let mut parts = parts_with_auth(Some(&rotated.token));
+        AuthUser::from_request_parts(&mut parts, &state)
+            .await
+            .expect("refreshed token must authenticate")
+    };
+    assert_eq!(new_auth.user_id, user.id);
+    assert_eq!(new_auth.session_id, user.session_id);
+
+    // ...and the row keeps the old token as the grace token.
+    let row: (String, Option<String>) =
+        sqlx::query_as("SELECT token, prev_token FROM sessions WHERE id = $1")
+            .bind(user.session_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(row.0, rotated.token);
+    assert_eq!(row.1.as_deref(), Some(old_token.as_str()));
+
+    // Expiry was moved out, not left at the original value.
+    let new_expires_at: (chrono::DateTime<chrono::Utc>,) =
+        sqlx::query_as("SELECT expires_at FROM sessions WHERE id = $1")
+            .bind(user.session_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert!(
+        new_expires_at.0 > old_expires_at.0,
+        "refresh must extend expiry"
+    );
+    // Grace window is roughly now + 2 minutes (both endpoints of the promise).
+    let grace: (chrono::DateTime<chrono::Utc>,) =
+        sqlx::query_as("SELECT prev_token_valid_until FROM sessions WHERE id = $1")
+            .bind(user.session_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    let now = chrono::Utc::now();
+    assert!(
+        grace.0 > now && grace.0 < now + chrono::Duration::minutes(3),
+        "grace window should be about two minutes, got {:?}",
+        grace.0 - now
+    );
+
+    // The spent nonce cannot be replayed for another refresh.
+    let replay = refresh(
+        State(state.clone()),
+        AuthUser {
+            user_id: user.id,
+            token: rotated.token.clone(),
+            session_id: user.session_id,
+        },
+        AppJson(RefreshRequest {
+            nonce: nonce.nonce.clone(),
+            signature: sign_refresh(&signing, &nonce.nonce),
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        replay,
+        api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_nonce",
+            "Invalid or expired nonce",
+        )
+    );
+
+    cleanup(&state, &[user.id]).await;
+}
+
+#[tokio::test]
+async fn old_token_works_only_within_grace_window() {
+    let Some(state) = test_state().await else {
+        skip_notice("old_token_works_only_within_grace_window");
+        return;
+    };
+
+    let signing = signing_key(32);
+    let user = register_and_login(&state, "graceful", &public_key_pem(&signing)).await;
+
+    // Rotate the token.
+    let Json(nonce) = get_nonce(State(state.clone()), auth_of(&user))
+        .await
+        .unwrap();
+    let Json(rotated) = refresh(
+        State(state.clone()),
+        auth_of(&user),
+        AppJson(RefreshRequest {
+            nonce: nonce.nonce.clone(),
+            signature: sign_refresh(&signing, &nonce.nonce),
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Inside the grace window the old token still authenticates.
+    let mut parts = parts_with_auth(Some(&user.token));
+    let grace_auth = AuthUser::from_request_parts(&mut parts, &state)
+        .await
+        .expect("prev_token must authenticate during grace window");
+    assert_eq!(grace_auth.user_id, user.id);
+    assert_eq!(grace_auth.session_id, user.session_id);
+
+    // Now close the grace window and the old token stops working.
+    sqlx::query(
+        "UPDATE sessions SET prev_token_valid_until = now() - interval '1 second' WHERE id = $1",
+    )
+    .bind(user.session_id)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    let mut parts = parts_with_auth(Some(&user.token));
+    assert_eq!(
+        AuthUser::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_err(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // And the new token continues to work.
+    let mut parts = parts_with_auth(Some(&rotated.token));
+    let new_auth = AuthUser::from_request_parts(&mut parts, &state)
+        .await
+        .expect("new token must keep authenticating");
+    assert_eq!(new_auth.session_id, user.session_id);
+
+    cleanup(&state, &[user.id]).await;
+}
+
+#[tokio::test]
+async fn refresh_rejects_invented_foreign_and_forged_nonces() {
+    let Some(state) = test_state().await else {
+        skip_notice("refresh_rejects_invented_foreign_and_forged_nonces");
+        return;
+    };
+
+    let signing = signing_key(33);
+    let user = register_and_login(&state, "skeptical", &public_key_pem(&signing)).await;
+    let other = register_and_login(&state, "skepticb", "other-key").await;
+
+    // Invented nonce never issued by the server, even fully signed.
+    let invented = format!("invented_{}", Uuid::new_v4().simple());
+    let invented_err = refresh(
+        State(state.clone()),
+        auth_of(&user),
+        AppJson(RefreshRequest {
+            nonce: invented.clone(),
+            signature: sign_refresh(&signing, &invented),
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        invented_err,
+        api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_nonce",
+            "Invalid or expired nonce",
+        )
+    );
+
+    // A nonce issued to another session cannot drive this session's refresh.
+    let Json(foreign) = get_nonce(State(state.clone()), auth_of(&other))
+        .await
+        .unwrap();
+    let cross_err = refresh(
+        State(state.clone()),
+        auth_of(&user),
+        AppJson(RefreshRequest {
+            nonce: foreign.nonce.clone(),
+            signature: sign_refresh(&signing, &foreign.nonce),
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        cross_err,
+        api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_nonce",
+            "Invalid or expired nonce",
+        )
+    );
+
+    // Spending nonce of own session with a signature of another key fails,
+    // and the nonce stays unspent only in the good path — here it IS spent.
+    let Json(mine) = get_nonce(State(state.clone()), auth_of(&user))
+        .await
+        .unwrap();
+    let forged_sig = sign_refresh(&signing_key(99), &mine.nonce);
+    let forged_err = refresh(
+        State(state.clone()),
+        auth_of(&user),
+        AppJson(RefreshRequest {
+            nonce: mine.nonce,
+            signature: forged_sig,
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        forged_err,
+        api_error(
+            StatusCode::UNAUTHORIZED,
+            "key_not_verified",
+            "Key not verified",
+        )
+    );
+
+    // Token must not have rotated in any failed attempt.
+    let current: (String,) = sqlx::query_as("SELECT token FROM sessions WHERE id = $1")
+        .bind(user.session_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(current.0, user.token);
+
+    cleanup(&state, &[user.id, other.id]).await;
+}
+
+#[tokio::test]
+async fn delete_session_signature_cannot_authorize_refresh() {
+    let Some(state) = test_state().await else {
+        skip_notice("delete_session_signature_cannot_authorize_refresh");
+        return;
+    };
+
+    let signing = signing_key(34);
+    let user = register_and_login(&state, "lukeskywalker", &public_key_pem(&signing)).await;
+
+    // Correct nonce, but signed with the delete-session message format.
+    let Json(nonce) = get_nonce(State(state.clone()), auth_of(&user))
+        .await
+        .unwrap();
+    let cross_purpose_sig = sign_delete_session(&signing, &user.session_id, &nonce.nonce);
+    let err = refresh(
+        State(state.clone()),
+        auth_of(&user),
+        AppJson(RefreshRequest {
+            nonce: nonce.nonce.clone(),
+            signature: cross_purpose_sig,
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        api_error(
+            StatusCode::UNAUTHORIZED,
+            "key_not_verified",
+            "Key not verified",
+        )
+    );
+
+    // Token unchanged.
+    let current: (String,) = sqlx::query_as("SELECT token FROM sessions WHERE id = $1")
+        .bind(user.session_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(current.0, user.token);
+
+    cleanup(&state, &[user.id]).await;
+}
+
+#[tokio::test]
+async fn expired_token_cannot_refresh() {
+    let Some(state) = test_state().await else {
+        skip_notice("expired_token_cannot_refresh");
+        return;
+    };
+
+    let signing = signing_key(35);
+    let user = register_and_login(&state, "expired", &public_key_pem(&signing)).await;
+
+    // Move session expiry into the past (3 minutes ago).
+    sqlx::query("UPDATE sessions SET expires_at = now() - interval '3 minutes' WHERE id = $1")
+        .bind(user.session_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    // Keep prev_token as-is: the session never refreshed, so prev_token is NULL.
+
+    // AuthUser extractor refuses the expired token, so /refresh is unreachable.
+    let mut parts = parts_with_auth(Some(&user.token));
+    assert_eq!(
+        AuthUser::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_err(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // Even reaching the handler directly cannot resurrect an expired session.
+    // Issue a legitimately signed refresh request and watch the expiry guard fire.
+    let invented = format!("issued_{}", Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO nonces (nonce, session_id, expires_at)
+         VALUES ($1, $2, now() + interval '60 seconds')",
+    )
+    .bind(&invented)
+    .bind(user.session_id)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    let refresh_err = refresh(
+        State(state.clone()),
+        auth_of(&user),
+        AppJson(RefreshRequest {
+            nonce: invented.clone(),
+            signature: sign_refresh(&signing, &invented),
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        refresh_err,
+        api_error(
+            StatusCode::UNAUTHORIZED,
+            "token_expired",
+            "Token is expired and cannot be refreshed",
+        )
+    );
+
+    // Server side: nothing rotated.
+    let row: (String, Option<String>) =
+        sqlx::query_as("SELECT token, prev_token FROM sessions WHERE id = $1")
+            .bind(user.session_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(row.0, user.token);
+    assert!(row.1.is_none(), "no grace token must appear");
+
+    cleanup(&state, &[user.id]).await;
+}
+
+#[tokio::test]
+async fn grace_token_cannot_survive_session_expiry() {
+    let Some(state) = test_state().await else {
+        skip_notice("grace_token_cannot_survive_session_expiry");
+        return;
+    };
+
+    let signing = signing_key(36);
+    let user = register_and_login(&state, "graceexpired", &public_key_pem(&signing)).await;
+
+    let Json(nonce) = get_nonce(State(state.clone()), auth_of(&user))
+        .await
+        .unwrap();
+    let Json(rotated) = refresh(
+        State(state.clone()),
+        auth_of(&user),
+        AppJson(RefreshRequest {
+            nonce: nonce.nonce.clone(),
+            signature: sign_refresh(&signing, &nonce.nonce),
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Old token works within the grace window...
+    let mut parts = parts_with_auth(Some(&user.token));
+    AuthUser::from_request_parts(&mut parts, &state)
+        .await
+        .expect("grace token must authenticate right after rotation");
+
+    // ...but once the session expires overall, even prev_token is dead.
+    sqlx::query("UPDATE sessions SET expires_at = now() - interval '3 minutes' WHERE id = $1")
+        .bind(user.session_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let mut parts = parts_with_auth(Some(&user.token));
+    assert_eq!(
+        AuthUser::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_err(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // Same for the fresh token: session expiry kills it too.
+    let mut parts = parts_with_auth(Some(&rotated.token));
+    assert_eq!(
+        AuthUser::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_err(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    cleanup(&state, &[user.id]).await;
+}
+
+#[tokio::test]
+async fn login_persists_expires_at_matching_response() {
+    let Some(state) = test_state().await else {
+        skip_notice("login_persists_expires_at_matching_response");
+        return;
+    };
+
+    let user = register_and_login(&state, "ttl", "device-key").await;
+
+    let db_expires_at: (chrono::DateTime<chrono::Utc>,) =
+        sqlx::query_as("SELECT expires_at FROM sessions WHERE id = $1")
+            .bind(user.session_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+
+    // The response's expires_at is within the 72h TTL the login endpoint
+    // advertises; the DB row must be consistent with it, not with the
+    // 30-day value some earlier code used.
+    let now = chrono::Utc::now();
+    assert!(
+        db_expires_at.0 > now + chrono::Duration::hours(70),
+        "DB expiry should be ~72h out, got {:?}",
+        db_expires_at.0 - now
+    );
+    assert!(
+        db_expires_at.0 < now + chrono::Duration::hours(80),
+        "DB expiry should be well under 30 days"
+    );
+
+    cleanup(&state, &[user.id]).await;
 }
