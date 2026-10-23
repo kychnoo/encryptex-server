@@ -46,9 +46,8 @@ pub async fn send_message(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let members: Vec<(Uuid,)> =
-        sqlx::query_as("SELECT user_id FROM chat_members WHERE chat_id = $1 AND user_id != $2")
+        sqlx::query_as("SELECT user_id FROM chat_members WHERE chat_id = $1")
             .bind(chat_id)
-            .bind(auth.user_id)
             .fetch_all(&state.db)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -56,8 +55,10 @@ pub async fn send_message(
     let payload_json = serde_json::to_string(&message).unwrap();
     let connections = state.connections.read().await;
     for (member_id,) in members {
-        if let Some(sender) = connections.get(&member_id) {
-            let _ = sender.send(payload_json.clone());
+        if let Some(sessions) = connections.get(&member_id) {
+            for sender in sessions.values() {
+                let _ = sender.send(payload_json.clone());
+            }
         }
     }
 

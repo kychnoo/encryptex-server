@@ -166,30 +166,16 @@ pub async fn refresh(
     )
     .await?;
 
-    let (not_expired,): (bool,) =
-        sqlx::query_as("SELECT expires_at > now() FROM sessions WHERE id = $1")
-            .bind(auth.session_id)
-            .fetch_one(&state.db)
-            .await
-            .map_err(internal_error)?;
-    if !not_expired {
-        return Err(api_error(
-            StatusCode::UNAUTHORIZED,
-            "token_expired",
-            "Token is expired and cannot be refreshed",
-        ));
-    }
-
     let token = generate_token();
     let expires_at = Utc::now() + Duration::hours(SESSION_TTL_HOURS);
 
-    sqlx::query(
+    let updated = sqlx::query(
         "UPDATE sessions
         SET prev_token = token,
             prev_token_valid_until = now() + interval '2 minutes',
             token = $1,
             expires_at = $2
-        WHERE id = $3",
+        WHERE id = $3 AND expires_at > now()",
     )
     .bind(&token)
     .bind(expires_at)
@@ -197,6 +183,14 @@ pub async fn refresh(
     .execute(&state.db)
     .await
     .map_err(internal_error)?;
+
+    if updated.rows_affected() == 0 {
+        return Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "token_expired",
+            "Token is expired and cannot be refreshed",
+        ));
+    }
 
     Ok(Json(RefreshResponse { token, expires_at }))
 }
@@ -266,6 +260,10 @@ pub async fn delete_session(
             "session_not_found",
             "Session not found",
         ));
+    }
+
+    if let Some(sessions) = state.connections.write().await.get_mut(&auth.user_id) {
+        sessions.remove(&session_id);
     }
 
     Ok(StatusCode::NO_CONTENT)

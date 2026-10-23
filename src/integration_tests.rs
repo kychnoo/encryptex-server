@@ -496,9 +496,22 @@ async fn send_message_broadcasts_to_ws_members() {
     .await
     .unwrap();
 
-    // Simulate Bob's live WebSocket connection.
+    // Simulate Bob's two live websocket connections (one per device session).
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    state.connections.write().await.insert(bob.id, tx);
+    let (tx2, mut rx2) = mpsc::unbounded_channel::<String>();
+    let bob_session2 = login_with_key(&state, bob.id, "any", "any", "key-b").await;
+    assert_ne!(bob_session2.session_id, bob.session_id);
+    {
+        let mut conns = state.connections.write().await;
+        conns
+            .entry(bob.id)
+            .or_default()
+            .insert(bob.session_id, tx);
+        conns
+            .entry(bob.id)
+            .or_default()
+            .insert(bob_session2.session_id, tx2);
+    }
 
     let Json(sent) = send_message(
         State(state.clone()),
@@ -512,6 +525,7 @@ async fn send_message_broadcasts_to_ws_members() {
     .unwrap();
     assert_eq!(sent.text, "hello via ws");
 
+    // Every live session of the member receives the push.
     let received = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
         .expect("ws push must arrive promptly")
@@ -521,6 +535,19 @@ async fn send_message_broadcasts_to_ws_members() {
     assert_eq!(payload["chat_id"], chat.id.to_string());
     assert_eq!(payload["sender_id"], alice.id.to_string());
 
+    let received2 = tokio::time::timeout(Duration::from_secs(5), rx2.recv())
+        .await
+        .expect("second device push must arrive promptly")
+        .expect("channel must stay open");
+    let payload2: serde_json::Value = serde_json::from_str(&received2).unwrap();
+    assert_eq!(payload2["text"], "hello via ws");
+
+    // The sender does not receive their own message back.
+    // Alice has no live connection here; assert the map has no entry for her.
+    let conns = state.connections.read().await;
+    assert!(!conns.contains_key(&alice.id));
+
+    drop(conns);
     state.connections.write().await.remove(&bob.id);
     cleanup(&state, &[alice.id, bob.id]).await;
 }
