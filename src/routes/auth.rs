@@ -19,9 +19,12 @@ use crate::{
     auth::{self, AuthUser},
     error::{ApiError, ErrorResult, api_error, internal_error},
     json::AppJson,
-    models::session::{
-        DeleteSessionRequest, LoginRequest, LoginResponse, NonceResponse, RefreshRequest,
-        RefreshResponse, Session, UserWithPassword,
+    models::{
+        session::{
+            DeleteSessionRequest, LoginRequest, LoginResponse, NonceResponse, RefreshRequest,
+            RefreshResponse, Session, UserWithPassword,
+        },
+        user::ChangePasswordRequest,
     },
     state::AppState,
 };
@@ -112,8 +115,10 @@ pub async fn login(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown");
 
+    let session_id = Uuid::now_v7();
+
     sqlx::query("INSERT INTO sessions (id, user_id, token, device_info, ip_address, public_key, expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7)")
-        .bind(Uuid::now_v7())
+        .bind(session_id)
         .bind(user.id)
         .bind(&token)
         .bind(device_info)
@@ -123,6 +128,15 @@ pub async fn login(
         .execute(&state.db)
         .await
         .map_err(internal_error)?;
+
+    if let Err(e) = sqlx::query("UPDATE sessions SET is_master = true WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM sessions WHERE user_id = $2 AND is_master)")
+        .bind(session_id)
+        .bind(user.id)
+        .execute(&state.db)
+        .await
+    {
+        eprintln!("Master assign: {e:?}")
+    }
 
     sqlx::query("DELETE FROM login_failures WHERE username = $1")
         .bind(&payload.username)
@@ -238,6 +252,23 @@ pub async fn delete_session(
     AppJson(payload): AppJson<DeleteSessionRequest>,
 ) -> Result<StatusCode, ApiError> {
     let message = delete_session_message(&session_id, &payload.nonce);
+
+    if session_id != auth.session_id {
+        let (is_master,): (bool,) = sqlx::query_as("SELECT is_master FROM sessions WHERE id = $1")
+            .bind(auth.session_id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(internal_error)?;
+
+        if !is_master {
+            return Err(api_error(
+                StatusCode::FORBIDDEN,
+                "master_required",
+                "Only the master session can revoke other sessions",
+            ));
+        }
+    }
+
     verify_device_signature(
         &state.db,
         auth.session_id,
@@ -264,6 +295,81 @@ pub async fn delete_session(
 
     if let Some(sessions) = state.connections.write().await.get_mut(&auth.user_id) {
         sessions.remove(&session_id);
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn change_password(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    AppJson(payload): AppJson<ChangePasswordRequest>,
+) -> Result<StatusCode, ApiError> {
+    if payload.new_password.len() < 6 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "weak_password",
+            "Password must be at least 6 characters",
+        ));
+    }
+
+    let (username,): (String,) = sqlx::query_as("SELECT username FROM users WHERE id = $1")
+        .bind(auth.user_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(internal_error)?;
+
+    if is_locked_out(&state.db, &username).await? {
+        return Err(api_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too_many_attempts",
+            "Too many failed attempts, try again later",
+        ));
+    }
+
+    if find_and_verify(&state.db, &username, &payload.old_password)
+        .await?
+        .is_none()
+    {
+        record_failure(&state.db, &username).await;
+        return Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_credentials",
+            "Invalid authorization credentials",
+        ));
+    }
+
+    let new_password = payload.new_password;
+    let new_hash = tokio::task::spawn_blocking(move || auth::hash_password(&new_password))
+        .await
+        .map_err(internal_error)?;
+
+    let mut tx = state.db.begin().await.map_err(internal_error)?;
+
+    sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
+        .bind(&new_hash)
+        .bind(auth.user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+
+    sqlx::query("DELETE FROM sessions WHERE user_id = $1 AND id != $2")
+        .bind(&auth.user_id)
+        .bind(auth.session_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+
+    sqlx::query("UPDATE sessions SET is_master = true WHERE id = $1")
+        .bind(auth.session_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+
+    tx.commit().await.map_err(internal_error)?;
+
+    if let Some(conns) = state.connections.write().await.get_mut(&auth.user_id) {
+        conns.retain(|sid, _| *sid == auth.session_id);
     }
 
     Ok(StatusCode::NO_CONTENT)

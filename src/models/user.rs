@@ -13,6 +13,12 @@ pub struct User {
     pub username: String,
 }
 
+#[derive(Deserialize)]
+pub struct ChangePasswordRequest {
+    pub old_password: String,
+    pub new_password: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

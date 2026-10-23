@@ -14,13 +14,13 @@ use axum::{
     Router,
     routing::{delete, get, post},
 };
-use sqlx::postgres::PgPoolOptions;
+use sqlx::{PgPool, postgres::PgPoolOptions};
 use tokio::sync::RwLock;
 use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 
 use crate::{
     routes::{
-        auth::{delete_session, get_nonce, list_sessions, login, refresh},
+        auth::{change_password, delete_session, get_nonce, list_sessions, login, refresh},
         chats::{create_chat, list_my_chats},
         messages::{list_messages, send_message},
         users::{create_user, list_users, me},
@@ -41,6 +41,7 @@ async fn main() {
         .connect(&database_url)
         .await
         .expect("Error on connecting to DB");
+    let cleanup_pool = pool.clone();
 
     let state = AppState {
         db: pool,
@@ -63,6 +64,7 @@ async fn main() {
         )
         .route("/login", post(login).layer(limiter.clone()))
         .route("/refresh", post(refresh))
+        .route("/password", post(change_password))
         .route("/me", get(me))
         .route("/chats", post(create_chat).get(list_my_chats))
         .route(
@@ -79,6 +81,8 @@ async fn main() {
         .await
         .unwrap();
 
+    spawn_cleanup(cleanup_pool);
+
     println!("Server listen on http://localhost:{server_port}");
 
     axum::serve(
@@ -87,4 +91,22 @@ async fn main() {
     )
     .await
     .unwrap();
+}
+
+fn spawn_cleanup(db: PgPool) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+        loop {
+            tick.tick().await;
+            for q in [
+                "DELETE FROM nonces WHERE expires_at < now()",
+                "DELETE FROM sessions WHERE expires_at < now()",
+                "DELETE FROM login_failures WHERE created_at < now() - interval '15 minutes'",
+            ] {
+                if let Err(e) = sqlx::query(q).execute(&db).await {
+                    eprintln!("Cleanup: {e:?}");
+                }
+            }
+        }
+    });
 }
