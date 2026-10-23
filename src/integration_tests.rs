@@ -18,7 +18,7 @@ use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 
 use crate::{
-    auth::AuthUser,
+    auth::{AuthUser, hash_token},
     error::api_error,
     json::AppJson,
     models::{
@@ -63,12 +63,13 @@ struct TestUser {
     id: Uuid,
     token: String,
     session_id: Uuid,
+    username: String,
+    password: String,
 }
 
 fn auth_of(user: &TestUser) -> AuthUser {
     AuthUser {
         user_id: user.id,
-        token: user.token.clone(),
         session_id: user.session_id,
     }
 }
@@ -87,8 +88,9 @@ fn test_addr() -> ConnectInfo<SocketAddr> {
 }
 
 async fn session_id_for(state: &AppState, token: &str) -> Uuid {
-    sqlx::query_scalar("SELECT id FROM sessions WHERE token = $1")
-        .bind(token)
+    let token_hash = hash_token(token);
+    sqlx::query_scalar("SELECT id FROM sessions WHERE token_hash = $1")
+        .bind(token_hash)
         .fetch_one(&state.db)
         .await
         .expect("session must exist for issued token")
@@ -136,6 +138,8 @@ async fn login_with_key(
         id: user_id,
         token: session.token,
         session_id,
+        username: username.to_string(),
+        password: password.to_string(),
     }
 }
 
@@ -324,18 +328,17 @@ async fn auth_extractor_enforces_bearer_session() {
         .await
         .expect("valid token must authenticate");
     assert_eq!(auth.user_id, user.id);
-    assert_eq!(auth.token, user.token);
     assert_eq!(auth.session_id, user.session_id);
 
     // Expired sessions are rejected even with a correct token format.
     let expired_token = format!("expired_{}", Uuid::new_v4().simple());
     sqlx::query(
-        "INSERT INTO sessions (id, user_id, token, expires_at)
+        "INSERT INTO sessions (id, user_id, token_hash, expires_at)
          VALUES ($1, $2, $3, now() - interval '1 hour')",
     )
     .bind(Uuid::now_v7())
     .bind(user.id)
-    .bind(&expired_token)
+    .bind(hash_token(&expired_token))
     .execute(&state.db)
     .await
     .expect("expired session fixture must insert");
@@ -499,14 +502,12 @@ async fn send_message_broadcasts_to_ws_members() {
     // Simulate Bob's two live websocket connections (one per device session).
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     let (tx2, mut rx2) = mpsc::unbounded_channel::<String>();
-    let bob_session2 = login_with_key(&state, bob.id, "any", "any", "key-b").await;
+    let bob_session2 =
+        login_with_key(&state, bob.id, &bob.username, &bob.password, "key-b").await;
     assert_ne!(bob_session2.session_id, bob.session_id);
     {
         let mut conns = state.connections.write().await;
-        conns
-            .entry(bob.id)
-            .or_default()
-            .insert(bob.session_id, tx);
+        conns.entry(bob.id).or_default().insert(bob.session_id, tx);
         conns
             .entry(bob.id)
             .or_default()
@@ -763,11 +764,12 @@ async fn users_cannot_delete_foreign_sessions() {
     let attacker_signing = signing_key(22);
     let attacker = register_and_login(&state, "attacker", &public_key_pem(&attacker_signing)).await;
 
-    let victim_session_id: (Uuid,) = sqlx::query_as("SELECT id FROM sessions WHERE token = $1")
-        .bind(&victim.token)
-        .fetch_one(&state.db)
-        .await
-        .unwrap();
+    let victim_session_id: (Uuid,) =
+        sqlx::query_as("SELECT id FROM sessions WHERE token_hash = $1")
+            .bind(hash_token(&victim.token))
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
 
     let Json(nonce) = get_nonce(State(state.clone()), auth_of(&attacker))
         .await
@@ -843,13 +845,16 @@ async fn refresh_rotates_token_and_persists_grace_token() {
 
     // ...and the row keeps the old token as the grace token.
     let row: (String, Option<String>) =
-        sqlx::query_as("SELECT token, prev_token FROM sessions WHERE id = $1")
+        sqlx::query_as("SELECT token_hash, prev_token_hash FROM sessions WHERE id = $1")
             .bind(user.session_id)
             .fetch_one(&state.db)
             .await
             .unwrap();
-    assert_eq!(row.0, rotated.token);
-    assert_eq!(row.1.as_deref(), Some(old_token.as_str()));
+    assert_eq!(row.0, hash_token(&rotated.token.as_str()));
+    assert_eq!(
+        row.1.as_deref(),
+        Some(hash_token(old_token.as_str()).as_str())
+    );
 
     // Expiry was moved out, not left at the original value.
     let new_expires_at: (chrono::DateTime<chrono::Utc>,) =
@@ -881,7 +886,6 @@ async fn refresh_rotates_token_and_persists_grace_token() {
         State(state.clone()),
         AuthUser {
             user_id: user.id,
-            token: rotated.token.clone(),
             session_id: user.session_id,
         },
         AppJson(RefreshRequest {
@@ -1043,12 +1047,12 @@ async fn refresh_rejects_invented_foreign_and_forged_nonces() {
     );
 
     // Token must not have rotated in any failed attempt.
-    let current: (String,) = sqlx::query_as("SELECT token FROM sessions WHERE id = $1")
+    let current: (String,) = sqlx::query_as("SELECT token_hash FROM sessions WHERE id = $1")
         .bind(user.session_id)
         .fetch_one(&state.db)
         .await
         .unwrap();
-    assert_eq!(current.0, user.token);
+    assert_eq!(current.0, hash_token(&user.token.as_str()));
 
     cleanup(&state, &[user.id, other.id]).await;
 }
@@ -1088,12 +1092,12 @@ async fn delete_session_signature_cannot_authorize_refresh() {
     );
 
     // Token unchanged.
-    let current: (String,) = sqlx::query_as("SELECT token FROM sessions WHERE id = $1")
+    let current: (String,) = sqlx::query_as("SELECT token_hash FROM sessions WHERE id = $1")
         .bind(user.session_id)
         .fetch_one(&state.db)
         .await
         .unwrap();
-    assert_eq!(current.0, user.token);
+    assert_eq!(current.0, hash_token(&user.token));
 
     cleanup(&state, &[user.id]).await;
 }
@@ -1158,12 +1162,12 @@ async fn expired_token_cannot_refresh() {
 
     // Server side: nothing rotated.
     let row: (String, Option<String>) =
-        sqlx::query_as("SELECT token, prev_token FROM sessions WHERE id = $1")
+        sqlx::query_as("SELECT token_hash, prev_token_hash FROM sessions WHERE id = $1")
             .bind(user.session_id)
             .fetch_one(&state.db)
             .await
             .unwrap();
-    assert_eq!(row.0, user.token);
+    assert_eq!(row.0, hash_token(&user.token));
     assert!(row.1.is_none(), "no grace token must appear");
 
     cleanup(&state, &[user.id]).await;

@@ -12,7 +12,7 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::state::AppState;
+use crate::{auth::hash_token, state::AppState};
 
 #[derive(Deserialize)]
 pub struct WsAuthQuery {
@@ -25,9 +25,9 @@ pub async fn ws_handler(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     let row: Option<(Uuid, Uuid, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT id, user_id, expires_at FROM sessions WHERE token = $1 AND expires_at > now()",
+        "SELECT id, user_id, expires_at FROM sessions WHERE token_hash = $1 AND expires_at > now()",
     )
-    .bind(&query.token)
+    .bind(hash_token(&query.token))
     .fetch_optional(&state.db)
     .await
     .unwrap_or(None);

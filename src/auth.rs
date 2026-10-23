@@ -7,6 +7,7 @@ use axum::{
     http::{StatusCode, header},
 };
 use chrono::Utc;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::state::AppState;
@@ -14,7 +15,6 @@ use crate::state::AppState;
 #[derive(Debug)]
 pub struct AuthUser {
     pub user_id: Uuid,
-    pub token: String,
     pub session_id: Uuid,
 }
 
@@ -32,6 +32,10 @@ pub fn hash_password(password: &str) -> String {
         .hash_password(password.as_bytes(), &salt)
         .expect("Error hashing password")
         .to_string()
+}
+
+pub fn hash_token(token: &str) -> String {
+    hex::encode(Sha256::digest(token.as_bytes()))
 }
 
 pub fn verify_password(password: &str, hash: &str) -> bool {
@@ -58,10 +62,11 @@ impl FromRequestParts<AppState> for AuthUser {
             .ok_or(StatusCode::UNAUTHORIZED)?;
 
         let token = extract_bearer_token(header_value).ok_or(StatusCode::UNAUTHORIZED)?;
+        let token_hash = hash_token(token);
 
         let row: Option<(Uuid, Uuid, chrono::DateTime<Utc>)> =
-            sqlx::query_as("SELECT id, user_id, expires_at FROM sessions WHERE token = $1 OR (prev_token= $1 AND prev_token_valid_until > now())")
-                .bind(token)
+            sqlx::query_as("SELECT id, user_id, expires_at FROM sessions WHERE token_hash = $1 OR (prev_token_hash = $1 AND prev_token_valid_until > now())")
+                .bind(token_hash)
                 .fetch_optional(&state.db)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -79,7 +84,6 @@ impl FromRequestParts<AppState> for AuthUser {
 
         Ok(AuthUser {
             user_id,
-            token: token.to_string(),
             session_id: id,
         })
     }

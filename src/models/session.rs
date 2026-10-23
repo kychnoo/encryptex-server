@@ -37,7 +37,6 @@ pub struct UserWithPassword {
 pub struct Session {
     pub id: Uuid,
     pub user_id: Uuid,
-    pub token: String,
     pub expires_at: DateTime<Utc>,
 }
 
@@ -58,16 +57,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_serializes_without_leaking_extra_columns() {
+    fn session_serializes_without_leaking_token_material() {
         let session = Session {
             id: Uuid::nil(),
             user_id: Uuid::nil(),
-            token: "tok".to_string(),
             expires_at: chrono::DateTime::from_timestamp(0, 0).unwrap().into(),
         };
         let json = serde_json::to_value(&session).unwrap();
-        assert_eq!(json["token"], serde_json::json!("tok"));
-        for field in ["id", "user_id", "token", "expires_at"] {
+        // Neither the raw token nor its hash ever leaves the server.
+        assert!(json.get("token").is_none(), "raw token must not leak");
+        assert!(
+            json.get("token_hash").is_none(),
+            "token hash must not leak to clients"
+        );
+        for field in ["id", "user_id", "expires_at"] {
             assert!(json.get(field).is_some(), "missing field: {field}");
         }
     }

@@ -16,7 +16,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::{
-    auth::{self, AuthUser},
+    auth::{self, AuthUser, hash_token},
     error::{ApiError, ErrorResult, api_error, internal_error},
     json::AppJson,
     models::{
@@ -110,6 +110,7 @@ pub async fn login(
     };
 
     let token = generate_token();
+    let token_hash = hash_token(&token);
     let device_info = headers
         .get(axum::http::header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
@@ -117,10 +118,10 @@ pub async fn login(
 
     let session_id = Uuid::now_v7();
 
-    sqlx::query("INSERT INTO sessions (id, user_id, token, device_info, ip_address, public_key, expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7)")
+    sqlx::query("INSERT INTO sessions (id, user_id, token_hash, device_info, ip_address, public_key, expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7)")
         .bind(session_id)
         .bind(user.id)
-        .bind(&token)
+        .bind(token_hash)
         .bind(device_info)
         .bind(addr.ip().to_string())
         .bind(&payload.public_key)
@@ -155,7 +156,7 @@ pub async fn list_sessions(
     auth: AuthUser,
 ) -> Result<Json<Vec<Session>>, ApiError> {
     let sessions = sqlx::query_as::<_, Session>(
-        "SELECT id, user_id, token, expires_at FROM sessions WHERE user_id = $1",
+        "SELECT id, user_id, expires_at FROM sessions WHERE user_id = $1",
     )
     .bind(auth.user_id)
     .fetch_all(&state.db)
@@ -181,17 +182,18 @@ pub async fn refresh(
     .await?;
 
     let token = generate_token();
+    let token_hash = hash_token(&token);
     let expires_at = Utc::now() + Duration::hours(SESSION_TTL_HOURS);
 
     let updated = sqlx::query(
         "UPDATE sessions
-        SET prev_token = token,
+        SET prev_token_hash = token_hash,
             prev_token_valid_until = now() + interval '2 minutes',
-            token = $1,
+            token_hash = $1,
             expires_at = $2
         WHERE id = $3 AND expires_at > now()",
     )
-    .bind(&token)
+    .bind(token_hash)
     .bind(expires_at)
     .bind(auth.session_id)
     .execute(&state.db)
